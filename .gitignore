@@ -1,0 +1,25 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+.env
+.venv/
+venv/
+env/
+
+# Streamlit secrets (never commit API keys)
+.streamlit/secrets.toml
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Data files (bank statements are private)
+*.csv
+*.xlsx
+*.xls
