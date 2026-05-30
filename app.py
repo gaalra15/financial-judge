@@ -439,21 +439,28 @@ CSV_CATEGORY_MAP = {
 
 
 def _read_file(f) -> pd.DataFrame:
-    """Read CSV or Excel, trying multiple separators and encodings automatically."""
+    """Read CSV or Excel, trying multiple separators, encodings, and header row offsets."""
     name = f.name.lower()
     if name.endswith((".xlsx", ".xls")):
         return pd.read_excel(f)
     raw_bytes = f.read()
     f.seek(0)
+    best: pd.DataFrame | None = None
     for encoding in ["utf-8-sig", "utf-8", "latin-1", "cp1252"]:
-        for sep in [",", ";", "\t", "|"]:
-            try:
-                df = pd.read_csv(io.BytesIO(raw_bytes), sep=sep, encoding=encoding)
-                if len(df.columns) > 1:
-                    return df
-            except Exception:
-                continue
-    return pd.read_csv(io.BytesIO(raw_bytes))
+        for sep in [";", ",", "\t", "|"]:
+            for skip in range(8):          # try skipping up to 7 header rows
+                try:
+                    df = pd.read_csv(
+                        io.BytesIO(raw_bytes),
+                        sep=sep, encoding=encoding, skiprows=skip,
+                    )
+                    if len(df.columns) > 1 and len(df) > 0:
+                        # prefer the candidate with the most columns
+                        if best is None or len(df.columns) > len(best.columns):
+                            best = df
+                except Exception:
+                    continue
+    return best if best is not None else pd.read_csv(io.BytesIO(raw_bytes))
 
 
 def preprocess_dataframe(df: pd.DataFrame, account_label: str = ""):
@@ -2473,7 +2480,17 @@ if uploaded_files:
                 dfs.append(processed)
 
         if not dfs:
-            st.error("Could not parse any files. Please ensure they have description and amount columns.")
+            st.error("Could not parse your file automatically. See the diagnostic below.")
+            for f in uploaded_files:
+                f.seek(0)
+                _diag = _read_file(f)
+                st.markdown(f"**{f.name}** — columns detected:")
+                st.write(list(_diag.columns))
+                st.markdown("First 5 rows:")
+                st.dataframe(_diag.head(5))
+                st.info(
+                    "👆 Share a screenshot of this with Claude so the parser can be fixed for your specific format."
+                )
         else:
             df = pd.concat(dfs, ignore_index=True)
 
