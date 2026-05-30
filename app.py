@@ -240,26 +240,42 @@ CATEGORIES = {
                      "dominos", "papa johns", "taco bell", "wendys", "popeyes", "chipotle",
                      "starbucks", "coffee", "cafe", "dunkin", "espresso", "bakery", "deli",
                      "doordash", "uber eats", "glovo", "just eat", "deliveroo", "grubhub",
-                     "rappi", "postmates", "bar", "pub", "nightclub", "cocktail", "brewery"],
+                     "rappi", "postmates", "bar", "pub", "nightclub", "cocktail", "brewery",
+                     "restaurante", "tasca", "cerveceria", "taberna", "pizzeria", "cafeteria",
+                     "panaderia", "pasteleria", "hamburgueseria", "kebab", "telepizza",
+                     "100 montaditos", "vips", "friday", "foster"],
     "food":         ["grocery", "supermarket", "supermercado", "mercadona", "carrefour", "lidl",
                      "aldi", "whole foods", "trader joe", "tesco", "sainsburys", "walmart",
-                     "costco", "market", "bodega"],
+                     "costco", "market", "bodega",
+                     "hipercor", "alcampo", "eroski", "consum", "supercor", "ahorramas",
+                     "bon preu", "dia ", "simply", "froiz", "coviran", "spar"],
     "streaming":    ["netflix", "spotify", "hbo", "disney", "apple music", "youtube premium",
                      "twitch", "prime video", "dazn", "hulu", "paramount", "peacock",
-                     "apple tv", "crunchyroll", "mubi"],
+                     "apple tv", "crunchyroll", "mubi",
+                     "filmin", "movistar plus", "atresplayer", "rtve play", "mitele"],
     "transport":    ["uber", "lyft", "cabify", "bolt", "taxi", "bus", "metro", "train", "transit",
                      "fuel", "gas station", "gasolinera", "petrol", "shell", "bp", "chevron",
                      "exxon", "repsol", "cepsa", "galp", "parking", "toll", "airline", "flight",
                      "ryanair", "vueling", "iberia", "easyjet", "lufthansa", "delta", "airport",
-                     "car rental", "hertz", "enterprise"],
+                     "car rental", "hertz", "enterprise",
+                     "renfe", "fgc", "emt", "tmb", "blablacar", "aena", "bicing",
+                     "avlo", "alsa", "flixbus", "ouigo"],
     "shopping":     ["amazon", "ebay", "etsy", "zara", "h&m", "nike", "adidas", "fashion",
                      "clothing", "apparel", "best buy", "apple store", "ikea", "target",
-                     "home depot", "shop", "store", "mall"],
+                     "home depot", "shop", "store", "mall",
+                     "mango", "primark", "zalando", "shein", "decathlon", "aliexpress",
+                     "el corte ingles", "fnac", "media markt", "pccomponentes", "bershka",
+                     "pull&bear", "massimo dutti", "stradivarius", "lefties"],
     "entertainment": ["cinema", "movie", "theater", "concert", "steam", "xbox", "playstation",
-                      "nintendo", "game", "museum", "gym", "fitness", "yoga", "sport"],
+                      "nintendo", "game", "museum", "gym", "fitness", "yoga", "sport",
+                      "gimnasio", "cines", "teatro", "espectaculo", "concierto",
+                      "farmacia", "parafarmacia", "dentista", "clinica", "medico"],
     "bills":        ["electric", "water bill", "gas bill", "internet", "broadband", "phone bill",
                      "insurance", "rent", "mortgage", "subscription", "verizon", "t-mobile",
-                     "att", "comcast", "xfinity", "spectrum", "utility"],
+                     "att", "comcast", "xfinity", "spectrum", "utility",
+                     "movistar", "vodafone", "orange", "yoigo", "masmovil", "jazztel",
+                     "pepephone", "simyo", "endesa", "iberdrola", "naturgy", "fenosa",
+                     "comunidad", "ibi ", "hipoteca", "alquiler", "seguro"],
 }
 
 GORDON_RAMSAY_MEMES = [
@@ -463,6 +479,29 @@ def _read_file(f) -> pd.DataFrame:
     return best if best is not None else pd.read_csv(io.BytesIO(raw_bytes))
 
 
+def _clean_spanish_desc(desc: str) -> str:
+    """Strip Spanish bank prefixes and card noise for cleaner display + categorization."""
+    if not isinstance(desc, str):
+        return str(desc)
+    s = desc.strip()
+    prefixes = [
+        "PAGO MOVIL EN ", "COMPRA EN ", "COMPRA ", "PAGO EN ",
+        "TRANSFERENCIA A ", "TRANSFERENCIA DE ", "RECIBO ",
+        "DOMICILIACION ", "BIZUM A ", "BIZUM DE ",
+        "CAJERO ", "CARGO ", "ABONO ",
+    ]
+    s_up = s.upper()
+    for prefix in prefixes:
+        if s_up.startswith(prefix):
+            s = s[len(prefix):]
+            break
+    if "," in s:
+        s = s.split(",")[0]
+    s = re.sub(r"TARJ\.?\s*:\*\d+", "", s, flags=re.IGNORECASE)
+    s = re.sub(r"TARJETA\s+\d+", "", s, flags=re.IGNORECASE)
+    return s.strip().title() if s.strip() else desc.strip()
+
+
 def preprocess_dataframe(df: pd.DataFrame, account_label: str = ""):
     desc_candidates = ["description", "transaction description", "merchant", "name",
                        "payee", "details", "memo", "narration", "transaction",
@@ -510,28 +549,52 @@ def preprocess_dataframe(df: pd.DataFrame, account_label: str = ""):
         except Exception:
             pass
 
-    signed_amt = pd.to_numeric(df[amount_col], errors="coerce")
+    # Strip currency symbols before parsing
+    raw_str = (
+        df[amount_col].astype(str)
+        .str.replace("€", "", regex=False)
+        .str.replace("$", "", regex=False)
+        .str.replace("£", "", regex=False)
+        .str.strip()
+    )
+    signed_amt = pd.to_numeric(raw_str, errors="coerce")
     if signed_amt.isna().mean() > 0.5:
-        # Likely European format (1.234,56) — swap separators and retry
+        # European decimal format (1.234,56 or -3,54) — swap separators
         signed_amt = pd.to_numeric(
-            df[amount_col].astype(str)
-                .str.replace(r"\.", "", regex=True)
-                .str.replace(",", ".", regex=False),
+            raw_str.str.replace(r"\.", "", regex=True).str.replace(",", ".", regex=False),
             errors="coerce",
         )
+
+    # Clean descriptions (strips Spanish bank prefixes + card noise)
+    is_spanish = raw_str.str.contains("€", na=False).any()
+    descriptions = df[desc_col].astype(str)
+    if is_spanish:
+        descriptions = descriptions.apply(_clean_spanish_desc)
+
     result = pd.DataFrame({
-        "description": df[desc_col].astype(str),
+        "description": descriptions,
         "amount": signed_amt.abs(),
         "signed_amount": signed_amt,
     })
+
     if date_col:
-        result["date"] = pd.to_datetime(df[date_col], errors="coerce")
+        # Try DD/MM/YYYY first (Spanish/European), fall back to auto-detect
+        parsed_dates = pd.to_datetime(df[date_col], dayfirst=True, errors="coerce")
+        if parsed_dates.isna().mean() > 0.5:
+            parsed_dates = pd.to_datetime(df[date_col], errors="coerce")
+        result["date"] = parsed_dates
+
     if account_label:
         result["account"] = account_label
 
-    # Preserve Type column if present (used for income/expense split)
+    # Preserve or auto-assign income/expense type
     if "type" in df.columns:
         result["type"] = df["type"].astype(str).str.strip().str.lower().values
+    else:
+        neg = (signed_amt < 0).sum()
+        pos = (signed_amt > 0).sum()
+        if neg > 0 and pos > 0:
+            result["type"] = np.where(signed_amt < 0, "expense", "income")
 
     result = result.dropna(subset=["amount"])
     result = result[result["amount"] > 0]
