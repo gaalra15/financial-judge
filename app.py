@@ -438,10 +438,31 @@ CSV_CATEGORY_MAP = {
 }
 
 
+def _read_file(f) -> pd.DataFrame:
+    """Read CSV or Excel, trying multiple separators and encodings automatically."""
+    name = f.name.lower()
+    if name.endswith((".xlsx", ".xls")):
+        return pd.read_excel(f)
+    raw_bytes = f.read()
+    f.seek(0)
+    for encoding in ["utf-8-sig", "utf-8", "latin-1", "cp1252"]:
+        for sep in [",", ";", "\t", "|"]:
+            try:
+                df = pd.read_csv(io.BytesIO(raw_bytes), sep=sep, encoding=encoding)
+                if len(df.columns) > 1:
+                    return df
+            except Exception:
+                continue
+    return pd.read_csv(io.BytesIO(raw_bytes))
+
+
 def preprocess_dataframe(df: pd.DataFrame, account_label: str = ""):
     desc_candidates = ["description", "transaction description", "merchant", "name",
-                       "payee", "details", "memo", "narration", "transaction"]
-    amount_candidates = ["amount", "debit", "credit", "value", "sum", "charge", "withdrawal"]
+                       "payee", "details", "memo", "narration", "transaction",
+                       "concepto", "descripción", "descripcion", "movimiento",
+                       "comercio", "beneficiario", "referencia", "observaciones"]
+    amount_candidates = ["amount", "debit", "credit", "value", "sum", "charge", "withdrawal",
+                         "importe", "cargo", "abono", "debe", "haber", "cantidad", "cuantía"]
     df.columns = df.columns.str.lower().str.strip()
 
     desc_col = None
@@ -483,6 +504,14 @@ def preprocess_dataframe(df: pd.DataFrame, account_label: str = ""):
             pass
 
     signed_amt = pd.to_numeric(df[amount_col], errors="coerce")
+    if signed_amt.isna().mean() > 0.5:
+        # Likely European format (1.234,56) — swap separators and retry
+        signed_amt = pd.to_numeric(
+            df[amount_col].astype(str)
+                .str.replace(r"\.", "", regex=True)
+                .str.replace(",", ".", regex=False),
+            errors="coerce",
+        )
     result = pd.DataFrame({
         "description": df[desc_col].astype(str),
         "amount": signed_amt.abs(),
@@ -2438,7 +2467,7 @@ if uploaded_files:
     try:
         dfs = []
         for f in uploaded_files:
-            raw = pd.read_csv(f) if f.name.lower().endswith(".csv") else pd.read_excel(f)
+            raw = _read_file(f)
             processed = preprocess_dataframe(raw, account_label=account_labels[f.name])
             if processed is not None and len(processed) > 0:
                 dfs.append(processed)
