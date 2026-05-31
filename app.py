@@ -77,6 +77,31 @@ def hex_to_rgba(hex_color: str, alpha: float = 0.2) -> str:
     return f"rgba({r},{g},{b},{alpha})"
 
 
+@st.cache_data(show_spinner=False)
+def _read_and_process(file_bytes: bytes, file_name: str, account_label: str):
+    """Cached file parse + preprocessing — only re-runs when file content changes."""
+    name = file_name.lower()
+    if name.endswith((".xlsx", ".xls")):
+        raw = pd.read_excel(io.BytesIO(file_bytes))
+    else:
+        best: pd.DataFrame | None = None
+        for encoding in ["utf-8-sig", "utf-8", "latin-1", "cp1252"]:
+            for sep in [";", ",", "\t", "|"]:
+                for skip in range(8):
+                    try:
+                        df = pd.read_csv(
+                            io.BytesIO(file_bytes),
+                            sep=sep, encoding=encoding, skiprows=skip,
+                        )
+                        if len(df.columns) > 1 and len(df) > 0:
+                            if best is None or len(df.columns) > len(best.columns):
+                                best = df
+                    except Exception:
+                        continue
+        raw = best if best is not None else pd.read_csv(io.BytesIO(file_bytes))
+    return preprocess_dataframe(raw, account_label=account_label)
+
+
 @st.cache_data(ttl=3600, show_spinner=False)
 def _fetch_meme(url: str) -> bytes | None:
     """Fetch meme image bytes server-side so browser hotlink blocking can't interfere."""
@@ -243,7 +268,8 @@ CATEGORIES = {
                      "rappi", "postmates", "bar", "pub", "nightclub", "cocktail", "brewery",
                      "restaurante", "tasca", "cerveceria", "taberna", "pizzeria", "cafeteria",
                      "panaderia", "pasteleria", "hamburgueseria", "kebab", "telepizza",
-                     "100 montaditos", "vips", "friday", "foster"],
+                     "100 montaditos", "vips", "friday", "foster",
+                     "papizza", "makan", "caleido", "gato"],
     "food":         ["grocery", "supermarket", "supermercado", "mercadona", "carrefour", "lidl",
                      "aldi", "whole foods", "trader joe", "tesco", "sainsburys", "walmart",
                      "costco", "market", "bodega",
@@ -252,7 +278,8 @@ CATEGORIES = {
     "streaming":    ["netflix", "spotify", "hbo", "disney", "apple music", "youtube premium",
                      "twitch", "prime video", "dazn", "hulu", "paramount", "peacock",
                      "apple tv", "crunchyroll", "mubi",
-                     "filmin", "movistar plus", "atresplayer", "rtve play", "mitele"],
+                     "filmin", "movistar plus", "atresplayer", "rtve play", "mitele",
+                     "youtube", "google play", "google one", "icloud", "apple.com/bill"],
     "transport":    ["uber", "lyft", "cabify", "bolt", "taxi", "bus", "metro", "train", "transit",
                      "fuel", "gas station", "gasolinera", "petrol", "shell", "bp", "chevron",
                      "exxon", "repsol", "cepsa", "galp", "parking", "toll", "airline", "flight",
@@ -276,6 +303,44 @@ CATEGORIES = {
                      "movistar", "vodafone", "orange", "yoigo", "masmovil", "jazztel",
                      "pepephone", "simyo", "endesa", "iberdrola", "naturgy", "fenosa",
                      "comunidad", "ibi ", "hipoteca", "alquiler", "seguro"],
+}
+
+# ── PERSONAL KEYWORD MAP (checked before generic rules) ──────────────────────
+# Restaurants must come before transport so "uber eats" matches restaurants
+# before "uber" matches transport.
+PERSONAL_KEYWORDS = {
+    "restaurants": [
+        "gato", "taqueria puerco", "new west seoul",
+        "hey my coffee", "kiosco helados",
+        "uber *eats", "ubereats", "uber eats",
+        "glovo", "just eat", "deliveroo",
+    ],
+    "food": [
+        "mercadona", "dia ", "dia1", "dia8", "dia9", "dia 1", "dia 8", "dia 9",
+        "market principe", "mini market", "pama",
+        "arbitrade centr", "alliance vendin", "kiseron",
+    ],
+    "entertainment": [
+        "google youtube", "youtube", "netflix", "spotify",
+        "hbo", "disney", "dazn", "twitch", "steam", "playstation",
+    ],
+    "transport": [
+        "app crtm", "crtm", "renfe", "emt ",
+        "cabify", "uber", "blablacar",
+        "aena", "vueling", "iberia", "ryanair",
+    ],
+    "shopping": [
+        "lefties", "stradivarius", "bershka", "pull and bear",
+        "el corte ingles", "aliexpress", "shein", "zalando", "decathlon", "ikea",
+    ],
+    "savings": [
+        "transferencia inmediata", "transferencia a favor",
+    ],
+    "other": [
+        "claude.ai", "claude ai", "anthropic",
+        "www.use.ai", "use.ai", "openai", "chatgpt",
+        "mad get", "sugoi station",
+    ],
 }
 
 GORDON_RAMSAY_MEMES = [
@@ -414,17 +479,51 @@ CATEGORY_COLORS = {
     "shopping":      "#45B7D1",
     "entertainment": "#FED766",
     "bills":         "#97C475",
+    "savings":       "#2ECC71",
+    "refund":        "#95A5A6",
     "other":         "#C7B8EA",
 }
 
+CATEGORY_DISPLAY = {
+    "food":          "🛒 Food & Groceries",
+    "restaurants":   "🍽️ Restaurants & Dining",
+    "entertainment": "🎬 Entertainment",
+    "transport":     "🚇 Transport",
+    "shopping":      "🛍️ Shopping",
+    "savings":       "💰 Savings",
+    "bills":         "🧾 Bills & Utilities",
+    "other":         "📦 Other",
+    "refund":        "↩️ Refund",
+    "streaming":     "📺 Streaming",
+}
 
-def categorize_transaction(description: str) -> str:
+
+def categorize_transaction(description: str, amount: float = None) -> str:
     if not isinstance(description, str):
         return "other"
     desc_lower = description.lower()
+    desc_upper = description.upper().strip()
+
+    # Refunds — mark separately so they're excluded from expense analysis
+    if desc_upper.startswith("DEVOLUCION"):
+        return "refund"
+
+    # Amount-based disambiguation for merchants that appear in multiple categories
+    if "makaa" in desc_lower:
+        return "restaurants" if (amount is not None and abs(amount) > 20) else "food"
+    if "mm31bis" in desc_lower:
+        return "food" if (amount is not None and abs(amount) > 3) else "other"
+
+    # Personal keywords (highest priority — user's real bank data)
+    for category, keywords in PERSONAL_KEYWORDS.items():
+        if any(kw in desc_lower for kw in keywords):
+            return category
+
+    # Generic keyword rules
     for category, keywords in CATEGORIES.items():
         if any(kw in desc_lower for kw in keywords):
             return category
+
     return "other"
 
 
@@ -485,10 +584,11 @@ def _clean_spanish_desc(desc: str) -> str:
         return str(desc)
     s = desc.strip()
     prefixes = [
-        "PAGO MOVIL EN ", "COMPRA EN ", "COMPRA ", "PAGO EN ",
+        "TRANSACCION CONTACTLESS EN ", "PAGO MOVIL EN ", "COMPRA EN ",
+        "COMPRA SQ *", "COMPRA ", "PAGO EN ",
         "TRANSFERENCIA A ", "TRANSFERENCIA DE ", "RECIBO ",
         "DOMICILIACION ", "BIZUM A ", "BIZUM DE ",
-        "CAJERO ", "CARGO ", "ABONO ",
+        "INGRESO EN ", "CAJERO ", "CARGO ", "ABONO ",
     ]
     s_up = s.upper()
     for prefix in prefixes:
@@ -503,6 +603,33 @@ def _clean_spanish_desc(desc: str) -> str:
 
 
 def preprocess_dataframe(df: pd.DataFrame, account_label: str = ""):
+    import unicodedata
+
+    # Strip whitespace then apply an explicit name map before the lowercase pass.
+    # Using NFC normalization handles accented chars that Excel sometimes stores
+    # in NFD form (o + combining accent) vs the NFC form in Python string literals.
+    df.columns = df.columns.str.strip()
+    _COLUMN_MAP = {
+        "Fecha": "date", "Fecha operación": "date", "Fecha Operación": "date",
+        "Fecha operacion": "date", "Fecha valor": "date_value",
+        "Descripción": "description", "Descripcion": "description",
+        "Importe": "amount", "Saldo": "balance", "Divisa": "currency",
+        "Date": "date", "Transaction Date": "date", "Posted Date": "date",
+        "Description": "description", "Transaction Description": "description",
+        "Merchant": "description", "Name": "description",
+        "Amount": "amount", "Debit": "amount", "Transaction Amount": "amount",
+        "Category": "category_original", "Type": "type",
+    }
+    _rename = {}
+    for col in df.columns:
+        nfc = unicodedata.normalize("NFC", str(col))
+        if nfc in _COLUMN_MAP:
+            _rename[col] = _COLUMN_MAP[nfc]
+        elif col in _COLUMN_MAP:
+            _rename[col] = _COLUMN_MAP[col]
+    df = df.rename(columns=_rename)
+    print(f"[preprocess] Columns after mapping: {df.columns.tolist()}")
+
     desc_candidates = ["description", "transaction description", "merchant", "name",
                        "payee", "details", "memo", "narration", "transaction",
                        "concepto", "descripción", "descripcion", "movimiento",
@@ -536,18 +663,27 @@ def preprocess_dataframe(df: pd.DataFrame, account_label: str = ""):
     if not desc_col or not amount_col:
         return None
 
-    # Detect date column
+    # Detect date column — check known names first, then try auto-detect by parsing
+    _date_name_candidates = [
+        "date", "fecha", "fecha operación", "fecha operacion",
+        "data", "datum", "transaction date", "value date",
+    ]
     date_col = None
-    for col in df.columns:
-        if col in (desc_col, amount_col):
-            continue
-        try:
-            parsed = pd.to_datetime(df[col], errors="coerce")
-            if parsed.notna().sum() > len(df) * 0.5:
-                date_col = col
-                break
-        except Exception:
-            pass
+    for c in _date_name_candidates:
+        if c in df.columns and c not in (desc_col, amount_col):
+            date_col = c
+            break
+    if not date_col:
+        for col in df.columns:
+            if col in (desc_col, amount_col):
+                continue
+            try:
+                parsed = pd.to_datetime(df[col], dayfirst=True, errors="coerce")
+                if parsed.notna().sum() > len(df) * 0.5:
+                    date_col = col
+                    break
+            except Exception:
+                pass
 
     # Strip currency symbols before parsing
     raw_str = (
@@ -555,6 +691,7 @@ def preprocess_dataframe(df: pd.DataFrame, account_label: str = ""):
         .str.replace("€", "", regex=False)
         .str.replace("$", "", regex=False)
         .str.replace("£", "", regex=False)
+        .str.replace(r"\s*[A-Z]{3}\s*$", "", regex=True)  # strip EUR, USD, GBP, etc.
         .str.strip()
     )
     signed_amt = pd.to_numeric(raw_str, errors="coerce")
@@ -608,9 +745,9 @@ def preprocess_dataframe(df: pd.DataFrame, account_label: str = ""):
         if coverage >= 0.8:
             result["category"] = raw_cats.str.lower().map(CSV_CATEGORY_MAP).fillna("other").values
         else:
-            result["category"] = result["description"].apply(categorize_transaction)
+            result["category"] = result.apply(lambda row: categorize_transaction(row["description"], row["amount"]), axis=1)
     else:
-        result["category"] = result["description"].apply(categorize_transaction)
+        result["category"] = result.apply(lambda row: categorize_transaction(row["description"], row["amount"]), axis=1)
 
     return result
 
@@ -631,6 +768,7 @@ def detect_transfers(df: pd.DataFrame) -> set:
     return set(matched["_idx_a"].tolist()) | set(matched["_idx_b"].tolist())
 
 
+@st.cache_data(show_spinner=False)
 def calculate_health_score(df: pd.DataFrame):
     total = df["amount"].sum()
     if total == 0:
@@ -772,6 +910,7 @@ def category_stats(df: pd.DataFrame) -> dict:
     return stats
 
 
+@st.cache_data(show_spinner=False)
 def compute_score_components(df: pd.DataFrame) -> dict:
     work = df.copy()
     # attach month period if possible (reuse logic from category_stats)
@@ -804,8 +943,10 @@ def compute_score_components(df: pd.DataFrame) -> dict:
     # Component 3 — Savings Signal
     savings_keywords = ["savings", "investment", "transfer", "brokerage",
                         "retirement", "401k", "ira", "vanguard", "fidelity"]
-    has_savings = work["description"].str.lower().str.contains(
-        "|".join(savings_keywords), na=False).any()
+    has_savings = (
+        work["description"].str.lower().str.contains("|".join(savings_keywords), na=False).any()
+        or (work["category"] == "savings").any()
+    )
     savings_score = 25 if has_savings else 0
 
     # Component 4 — Month-over-Month Volatility
@@ -865,13 +1006,18 @@ def get_budget_recommendations(
     client = get_anthropic_client()
     system = (
         "You are a financial advisor. "
+        "Return ONLY a single JSON object — NOT an array. "
+        "Start with { and end with }. Never return a JSON array starting with [. "
         f"The user has a monthly income of {currency}{monthly_income:,.0f}. "
         f"Their current average monthly spending per category is: {cat_monthly_avgs}. "
         f"Their self-set monthly budget targets are: {budget_inputs}. "
-        "Return ONLY a valid JSON object, no markdown, no backticks. "
-        'Format: {"summary":"...","allocations":[{"category":"...","current_monthly_avg":0,'
-        '"user_budget":0,"suggested_budget":0,"suggested_pct":0,"reasoning":"...","status":"over|under|on_track"}],'
-        '"tips":[{"icon":"...","tip":"..."}]}'
+        "The object must have exactly these three keys: "
+        '"summary" (one sentence under 20 words), '
+        '"allocations" (array of objects each with: category, current_monthly_avg, user_budget, '
+        'suggested_budget, suggested_pct, reasoning, status), '
+        '"tips" (array of objects each with: icon, tip). '
+        'status must be exactly one of: "over", "under", "on_track". '
+        "Return ONLY the JSON object. No markdown. No backticks. No text before or after the JSON."
     )
     prompt = (
         f"Monthly income: {currency}{monthly_income:,.0f}. "
@@ -886,7 +1032,25 @@ def get_budget_recommendations(
         system=[{"type": "text", "text": system, "cache_control": {"type": "ephemeral"}}],
         messages=[{"role": "user", "content": prompt}]
     )
-    return parse_claude_json(response.content[0].text)
+    raw = response.content[0].text
+    print(f"[budget] raw response: {raw[:300]}")
+    result = parse_claude_json(raw)
+
+    # Normalize: Claude sometimes returns [{...}] instead of {...}
+    if isinstance(result, list):
+        if len(result) > 0 and isinstance(result[0], dict):
+            result = result[0]
+        else:
+            result = {
+                "summary": "Budget analysis complete.",
+                "allocations": result if all(isinstance(r, dict) for r in result) else [],
+                "tips": [],
+            }
+
+    if not isinstance(result, dict):
+        result = {"summary": "Budget analysis complete.", "allocations": [], "tips": []}
+
+    return result
 
 
 def render_budget_recommendations(data: dict, currency: str, monthly_income: float):
@@ -1298,6 +1462,38 @@ border:2px solid {score_color}; min-height:300px">
                 st.rerun()
 
 
+def build_export_excel(expense_df: pd.DataFrame, budget_data: dict | None) -> bytes:
+    buf = io.BytesIO()
+    with pd.ExcelWriter(buf, engine="openpyxl") as writer:
+        # Sheet 1 — categorized transactions
+        export_cols = [c for c in ["date", "description", "amount", "category", "account"] if c in expense_df.columns]
+        txn_sheet = expense_df[export_cols].copy()
+        if "date" in txn_sheet.columns:
+            txn_sheet["date"] = pd.to_datetime(txn_sheet["date"], errors="coerce").dt.strftime("%Y-%m-%d")
+        txn_sheet["category"] = txn_sheet["category"].map(
+            lambda c: CATEGORY_DISPLAY.get(c, c)
+        )
+        txn_sheet.columns = [c.capitalize() for c in txn_sheet.columns]
+        txn_sheet.to_excel(writer, sheet_name="Transactions", index=False)
+
+        # Sheet 2 — budget allocations (only if budget planner was run)
+        if budget_data and isinstance(budget_data, dict):
+            allocs = budget_data.get("allocations", [])
+            if allocs:
+                alloc_df = pd.DataFrame(allocs)
+                cols_order = [c for c in ["category", "current_monthly_avg", "user_budget",
+                                          "suggested_budget", "suggested_pct", "status", "reasoning"]
+                              if c in alloc_df.columns]
+                alloc_df[cols_order].to_excel(writer, sheet_name="Budget Allocations", index=False)
+
+            tips = budget_data.get("tips", [])
+            if tips:
+                tips_df = pd.DataFrame(tips)
+                tips_df.to_excel(writer, sheet_name="Budget Tips", index=False)
+
+    return buf.getvalue()
+
+
 def parse_claude_json(response_text: str):
     clean = re.sub(r'```json|```', '', response_text).strip()
 
@@ -1324,7 +1520,7 @@ def parse_claude_json(response_text: str):
         pass
 
     # Full fallback — return empty list so keyword matching takes over
-    st.error("Claude categorization failed entirely — using keyword matching as fallback.")
+    st.info("ℹ️ Using keyword matching for categorization.")
     return []
 
 
@@ -2274,7 +2470,26 @@ with st.sidebar:
         _toggle_label = "Switch to Light" if st.session_state.theme == "dark" else "Switch to Dark"
         if st.button(_toggle_label, key="theme_toggle"):
             st.session_state.theme = "light" if st.session_state.theme == "dark" else "dark"
-            st.rerun()
+
+    _sb_expense_df = st.session_state.get("sidebar_expense_df")
+    if _sb_expense_df is not None and len(_sb_expense_df) > 0:
+        st.divider()
+        st.markdown("#### ⬇️ Export")
+        _sb_budget = st.session_state.get("budget_data")
+        _excel_bytes = build_export_excel(_sb_expense_df, _sb_budget)
+        _export_label = (
+            "Download Excel (transactions + budget)"
+            if _sb_budget else
+            "Download Excel (transactions)"
+        )
+        st.download_button(
+            label=_export_label,
+            data=_excel_bytes,
+            file_name="financial_judge_export.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            use_container_width=True,
+            type="primary",
+        )
 
 # ── GLOBAL CSS ────────────────────────────────────────────────────────────
 st.markdown(f"""
@@ -2537,16 +2752,20 @@ if uploaded_files:
     try:
         dfs = []
         for f in uploaded_files:
-            raw = _read_file(f)
-            processed = preprocess_dataframe(raw, account_label=account_labels[f.name])
+            file_bytes = f.read()
+            processed = _read_and_process(file_bytes, f.name, account_labels[f.name])
             if processed is not None and len(processed) > 0:
                 dfs.append(processed)
 
         if not dfs:
             st.error("Could not parse your file automatically. See the diagnostic below.")
             for f in uploaded_files:
-                f.seek(0)
-                _diag = _read_file(f)
+                _diag_bytes = f.read()
+                name = f.name.lower()
+                if name.endswith((".xlsx", ".xls")):
+                    _diag = pd.read_excel(io.BytesIO(_diag_bytes))
+                else:
+                    _diag = pd.read_csv(io.BytesIO(_diag_bytes), nrows=10, on_bad_lines="skip")
                 st.markdown(f"**{f.name}** — columns detected:")
                 st.write(list(_diag.columns))
                 st.markdown("First 5 rows:")
@@ -2570,7 +2789,7 @@ if uploaded_files:
             if "type" in df.columns:
                 # CSV has an explicit Type column — use it directly
                 income_df = df[df["type"] == "income"].copy()
-                expense_df = df[(df["type"] == "expense") & (df["category"] != "internal_transfer")].copy()
+                expense_df = df[(df["type"] == "expense") & (df["category"] != "internal_transfer") & (df["category"] != "refund")].copy()
                 st.caption(f"Income/expense split from CSV Type column — {len(income_df)} income, {len(expense_df)} expense rows.")
             else:
                 # Fallback: let user pick sign convention or use keywords
@@ -2599,7 +2818,7 @@ if uploaded_files:
                         "|".join(_income_kws), na=False
                     )
                 income_df = df[df["is_income"]].copy()
-                expense_df = df[~df["is_income"] & (df["category"] != "internal_transfer")].copy()
+                expense_df = df[~df["is_income"] & (df["category"] != "internal_transfer") & (df["category"] != "refund")].copy()
 
             # Sidebar account filter
             if "account" in df.columns:
@@ -2609,7 +2828,18 @@ if uploaded_files:
                 )
                 expense_df = expense_df[expense_df["account"].isin(selected_accounts)]
 
-            st.success(f"Loaded {len(df)} transactions from {len(dfs)} file(s) — {len(expense_df)} expenses, {len(income_df)} income")
+            _date_range_str = ""
+            if "date" in df.columns:
+                _min_d, _max_d = df["date"].min(), df["date"].max()
+                if pd.notna(_min_d) and pd.notna(_max_d):
+                    _date_range_str = (
+                        f" · {pd.Timestamp(_min_d).strftime('%d/%m/%Y')}"
+                        f" to {pd.Timestamp(_max_d).strftime('%d/%m/%Y')}"
+                    )
+            st.success(
+                f"✅ Loaded {len(df)} transactions from {len(dfs)} file(s) — "
+                f"{len(expense_df)} expenses, {len(income_df)} income{_date_range_str}"
+            )
 
             # Income / savings rate summary
             income_total = income_df["amount"].sum()
@@ -2778,7 +3008,7 @@ color:{C['text_muted']}; font-size:0.85rem">
                         expense_df[editor_cols],
                         column_config={
                             "category": st.column_config.SelectboxColumn(
-                                "Category", options=list(CATEGORIES.keys()) + ["other"],
+                                "Category", options=list(CATEGORY_DISPLAY.keys()),
                             ),
                             "amount": st.column_config.NumberColumn("Amount ($)", format="$%.2f"),
                         },
@@ -2790,6 +3020,7 @@ color:{C['text_muted']}; font-size:0.85rem">
 
                 score, cat_pcts = calculate_health_score(expense_df)
                 df_for_analysis = expense_df
+                st.session_state["sidebar_expense_df"] = expense_df
 
                 # Build chat context once per file load; invalidate when row count changes
                 _ctx_fingerprint = len(expense_df)
@@ -2873,8 +3104,13 @@ color:{C['text_muted']}; font-size:0.85rem">
     <div style="color:{C['text_muted']}; font-size:0.75rem">{description}</div>
 </div>""", unsafe_allow_html=True)
                             st.markdown("---")
-                            with st.spinner("Generating what-if scenarios..."):
-                                whatif = get_whatif_lines(df_for_analysis, components, score)
+                            _whatif_key = f"whatif_{score}_{len(df_for_analysis)}"
+                            if _whatif_key not in st.session_state:
+                                with st.spinner("Generating what-if scenarios..."):
+                                    st.session_state[_whatif_key] = get_whatif_lines(
+                                        df_for_analysis, components, score
+                                    )
+                            whatif = st.session_state[_whatif_key]
                             for line in whatif:
                                 st.markdown(f"""
 <div style="background:{C['bg_secondary']}; border-left:3px solid {C['accent_primary']};
@@ -3081,6 +3317,7 @@ border:1px solid {C['border']}">
                                 budget_data = get_budget_recommendations(
                                     monthly_income, budget_inputs, cat_monthly_avgs, currency
                                 )
+                                st.session_state["budget_data"] = budget_data
                                 render_budget_recommendations(budget_data, currency, monthly_income)
                             except Exception as e:
                                 st.error(f"Budget recommendation failed: {str(e)}")
@@ -3234,6 +3471,22 @@ and a **Type** column with `income`/`expense` labels.
 
 Supported exports from: Chase, Bank of America, Wells Fargo, Revolut, N26, Monzo, BBVA, Santander, and most banks.
 """)
+        st.warning(
+            "**First row must be column headers** — the very first row of your file should contain the "
+            "column names (e.g. `Date`, `Description`, `Amount`), not actual transaction data. "
+            "If your bank export has extra intro rows above the headers, delete them before uploading."
+        )
+        st.warning(
+            "**Amount column must contain numbers, not text** — in Excel, check that the Amount column "
+            "is formatted as *Number* or *Currency*, not *Text* or *General with symbols*. "
+            "Values like `\"$1,234.56\"` stored as text will not be parsed correctly. "
+            "In CSV files, avoid quotes around numbers."
+        )
+        st.info(
+            "**Streamlit has a built-in dark / light mode** — click the **⋮ menu** in the top-right corner "
+            "of the page → *Settings* → *Theme*. Switching Streamlit's theme also updates this app's "
+            "chart colors and backgrounds to match."
+        )
     with sample_col:
         st.markdown("#### Try it now")
         st.markdown("Don't have your statement handy? Download a realistic 3-month sample:")
